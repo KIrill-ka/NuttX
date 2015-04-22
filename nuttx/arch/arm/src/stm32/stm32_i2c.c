@@ -257,6 +257,7 @@ struct stm32_i2c_priv_s
     uint8_t *ptr;                /* Current message buffer */
     int dcnt;                    /* Current message length */
     uint16_t flags;              /* Current message flags */
+    uint16_t f4xxbtf_read;       /* Special handling of end of read for stm4xx */
     
     /* I2C trace support */
     
@@ -613,7 +614,7 @@ static inline int stm32_i2c_sem_waitdone(FAR struct stm32_i2c_priv_s *priv, int 
         
 #elif CONFIG_STM32_I2CTIMEOMS > 0
         abstime.tv_nsec += CONFIG_STM32_I2CTIMEOMS * 1000 * 1000;
-        if (abstime.tv_nsec > 1000 * 1000 * 1000)
+        if (abstime.tv_nsec >= 1000 * 1000 * 1000)
         {
             abstime.tv_sec++;
             abstime.tv_nsec -= 1000 * 1000 * 1000;
@@ -745,7 +746,7 @@ static inline void stm32_i2c_sem_waitstop(FAR struct stm32_i2c_priv_s *priv, int
      * still pending.
      */
     
-    i2cvdbg("Timeout with CR1: %04x SR1: %04x\n", cr1, sr1);
+    i2cdbg("Timeout with CR1: %04x SR1: %04x\n", cr1, sr1);
 }
 
 /************************************************************************************
@@ -1171,6 +1172,7 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
             priv->ptr   = priv->msgv->buffer;
             priv->dcnt  = priv->msgv->length;
             priv->flags = priv->msgv->flags;
+            priv->f4xxbtf_read = 0;
         
             /* Send address byte and define addressing mode */
         
@@ -1183,6 +1185,10 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
             if (priv->dcnt > 1 && (priv->flags & I2C_M_READ) != 0)
             {
                 stm32_i2c_modifyreg(priv, STM32_I2C_CR1_OFFSET, 0, I2C_CR1_ACK);
+#if !defined(CONFIG_I2C_POLLED) && defined(CONFIG_STM32_STM32F40XX)
+                if(priv->dcnt == 3 && priv->msgc == 1)
+                 priv->f4xxbtf_read = 1; /* See comment below. */
+#endif
             }
         
             /* Increment to next pointer and decrement message count */
@@ -1222,19 +1228,13 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
     
     else if ((priv->flags & I2C_M_READ) != 0 && (status & I2C_SR1_ADDR) != 0)
     {
-        /* Enable RxNE and TxE buffers in order to receive one or multiple bytes */
-        
-#ifndef CONFIG_I2C_POLLED
-        stm32_i2c_traceevent(priv, I2CEVENT_ITBUFEN, 0);
-        stm32_i2c_modifyreg(priv, STM32_I2C_CR2_OFFSET, 0, I2C_CR2_ITBUFEN);
-#endif
     }
     
     /* More bytes to read */
     
-    else if ((status & I2C_SR1_RXNE) != 0)
+    else if ((status & I2C_SR1_RXNE) != 0 && !priv->f4xxbtf_read)
     {
-        /* Read a byte, if dcnt goes < 0, then read dummy bytes to ack ISRs */
+        /* Read a byte, if dcnt is 0, then read dummy bytes to ack ISRs */
         
         if (priv->dcnt > 0)
         {
@@ -1248,17 +1248,25 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
 #ifdef CONFIG_I2C_POLLED
             irqstate_t state = irqsave();
 #endif
-            /* Receive a byte */
-            
-            *priv->ptr++ = stm32_i2c_getreg(priv, STM32_I2C_DR_OFFSET);
-            
-            /* Disable acknowledge when last byte is to be received */
-            
             priv->dcnt--;
-            if (priv->dcnt == 1)
+
+#if !defined(CONFIG_I2C_POLLED) && defined(CONFIG_STM32_STM32F40XX)
+            /* We need to stop before the last byte to set ACK flag in time.
+             * Now read current byte and wait for BTF interrupt which means
+             * that 2 bytes are read and scl stretching is activated before
+             * the last byte.
+             */
+            if(priv->dcnt == 3 && priv->msgc == 0) priv->f4xxbtf_read = 1;
+            else 
+#endif
             {
+             /* Disable acknowledge when last byte is to be received */
+             if (priv->dcnt == 1)
                 stm32_i2c_modifyreg(priv, STM32_I2C_CR1_OFFSET, I2C_CR1_ACK, 0);
             }
+            
+            /* Receive a byte */
+            *priv->ptr++ = stm32_i2c_getreg(priv, STM32_I2C_DR_OFFSET);
             
 #ifdef CONFIG_I2C_POLLED
             irqrestore(state);
@@ -1278,11 +1286,24 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
 	    */
             stm32_i2c_putreg(priv, STM32_I2C_DR_OFFSET, 0);
     } else if (status & I2C_SR1_BTF) {
+     if(priv->f4xxbtf_read && priv->dcnt > 0) {
+      if(priv->dcnt == 3) {
+         stm32_i2c_modifyreg(priv, STM32_I2C_CR1_OFFSET, I2C_CR1_ACK, 0);
+         *priv->ptr++ = stm32_i2c_getreg(priv, STM32_I2C_DR_OFFSET);
+         priv->dcnt--;
+      } else {
+         stm32_i2c_modifyreg(priv, STM32_I2C_CR1_OFFSET, 0, I2C_CR1_STOP);
+         *priv->ptr++ = stm32_i2c_getreg(priv, STM32_I2C_DR_OFFSET);
+         *priv->ptr++ = stm32_i2c_getreg(priv, STM32_I2C_DR_OFFSET);
+         priv->dcnt -= 2;
+      }
+     } else {
 	    /*
 	      we should have handled all cases where this could happen
 	      above, but just to ensure it gets acked, lets clear it here
 	     */
-            stm32_i2c_getreg(priv, STM32_I2C_DR_OFFSET);
+        stm32_i2c_getreg(priv, STM32_I2C_DR_OFFSET);
+     }
     } else if (status & I2C_SR1_STOPF) {
 	    /*
 	      we should never get this, as we are a master not a
@@ -1297,12 +1318,12 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
      */
     
 #ifndef CONFIG_I2C_POLLED
-    if (priv->dcnt > 0)
+    if (priv->dcnt > 0 && !priv->f4xxbtf_read)
     {
         stm32_i2c_traceevent(priv, I2CEVENT_REITBUFEN, 0);
         stm32_i2c_modifyreg(priv, STM32_I2C_CR2_OFFSET, 0, I2C_CR2_ITBUFEN);
     }
-    else if (priv->dcnt == 0)
+    else
     {
         stm32_i2c_traceevent(priv, I2CEVENT_DISITBUFEN, 0);
         stm32_i2c_modifyreg(priv, STM32_I2C_CR2_OFFSET, I2C_CR2_ITBUFEN, 0);
@@ -1314,9 +1335,9 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
      */
     
 #if defined(CONFIG_STM32_STM32F20XX) || defined(CONFIG_STM32_STM32F40XX)
-    if (priv->dcnt <= 0 && (status & (I2C_SR1_BTF|I2C_SR1_RXNE)) != 0)
+    if (priv->dcnt == 0 && (status & (I2C_SR1_BTF|I2C_SR1_RXNE)) != 0)
 #else
-        if (priv->dcnt <= 0 && (status & I2C_SR1_BTF) != 0)
+        if (priv->dcnt == 0 && (status & I2C_SR1_BTF) != 0)
 #endif
         {
             stm32_i2c_getreg(priv, STM32_I2C_DR_OFFSET);    /* ACK ISR */
@@ -1337,6 +1358,7 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
                     priv->ptr   = priv->msgv->buffer;
                     priv->dcnt  = priv->msgv->length;
                     priv->flags = priv->msgv->flags;
+                    priv->f4xxbtf_read = 0;
                     priv->msgv++;
                     priv->msgc--;
                     
@@ -1355,7 +1377,7 @@ static int stm32_i2c_isr(struct stm32_i2c_priv_s *priv)
             else if (priv->msgv)
             {
                 stm32_i2c_traceevent(priv, I2CEVENT_BTFSTOP, 0);
-                stm32_i2c_sendstop(priv);
+                if(!priv->f4xxbtf_read)  stm32_i2c_sendstop(priv);
                 
                 /* Is there a thread waiting for this event (there should be) */
                 
@@ -2047,7 +2069,6 @@ int up_i2creset(FAR struct i2c_dev_s * dev)
     unsigned clock_count;
     unsigned stretch_count;
     int ret = ERROR;
-    irqstate_t state;
     
     ASSERT(dev);
     
